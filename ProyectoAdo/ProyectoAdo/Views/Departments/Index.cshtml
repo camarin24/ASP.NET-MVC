@@ -1,0 +1,27 @@
+﻿@model IEnumerable<ProyectoAdo.Models.Department>
+@{
+    ViewBag.Title = "Index";
+}
+
+<table>
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Nombre</th>
+            <th>Ubicación</th>
+            <th>Empledos</th>
+        </tr>
+    </thead>
+    <tbody>
+        @foreach(var elem in Model)
+        {
+            <tr>
+                <td>@elem.ID</td>
+                <td>@elem.Name</td>
+                <td>@elem.Location</td>
+                <td>@Html.ActionLink(elem.Name,"Index","Home",new { id = elem.ID },null)</td>
+            </tr>
+        }
+    </tbody>
+</table>
+

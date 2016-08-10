@@ -1,0 +1,640 @@
+using Dapper;
+using Q10.Core.Logging;
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Common;
+using System.Data.SqlClient;
+using System.Linq;
+using System.Reflection;
+using System.Threading.Tasks;
+
+namespace Q10.Core.Data
+{
+    public class DataAccess
+    {
+        private const int MAX_RETRIES = 5;
+        private readonly int[] LOCK_ERROR_NUMBERS = new int[] { 1205 };
+
+        private string connectionString;
+
+        public DataAccess(string connectionString)
+        {
+            this.connectionString = connectionString;
+        }
+
+        public string ConnectionString
+        {
+            get
+            {
+                return this.connectionString;
+            }
+        }
+
+        public string DataBase
+        {
+            get
+            {
+                var builder = new SqlConnectionStringBuilder(this.connectionString);
+                return builder.InitialCatalog;
+            }
+        }
+
+        public int Execute(string query, Dictionary<string, object> parameters, int retryCount = 0)
+        {
+            var p = new DynamicParameters();
+
+            foreach (var par in parameters)
+            {
+                p.Add("@" + par.Key, par.Value);
+            }
+
+            p.Add("@Return", dbType: DbType.Int32, direction: ParameterDirection.ReturnValue);
+
+            try
+            {
+                using (var conn = CreateConnection())
+                {
+                    conn.Open();
+                    conn.Execute(query, p);
+                }
+            }
+            catch (SqlException sqlex)
+            {
+                if (LOCK_ERROR_NUMBERS.Contains(sqlex.Number) && retryCount < MAX_RETRIES)
+                {
+                    Logger.Instance.Warn(sqlex.Message, "DataAccess");
+                    return Execute(query, parameters, ++retryCount);
+                }
+
+                throw new DatabaseException(sqlex.Number, sqlex.Message, query, parameters);
+            }
+            catch (Exception ex)
+            {
+                if (ex.Message.StartsWith("When using the multi-mapping APIs"))
+                {
+                    throw new DatabaseException(-999, ex.Message, query, parameters);
+                }
+                else
+                {
+                    throw;
+                }
+            }
+
+            var result = p.Get<int>("@Return");
+
+            return result;
+        }
+
+        public IList<T> Query<T>(string query, Dictionary<string, object> parameters, int retryCount = 0)
+        {
+            var p = new DynamicParameters();
+
+            foreach (var par in parameters)
+            {
+                p.Add("@" + par.Key, par.Value);
+            }
+
+            IList<T> result;
+
+            try
+            {
+                using (var conn = CreateConnection())
+                {
+                    conn.Open();
+                    result = conn.Query<T>(query, p).ToList();
+                }
+            }
+            catch (SqlException sqlex)
+            {
+                if (LOCK_ERROR_NUMBERS.Contains(sqlex.Number) && retryCount < MAX_RETRIES)
+                {
+                    Logger.Instance.Warn(sqlex.Message, "DataAccess");
+                    return Query<T>(query, parameters, ++retryCount);
+                }
+
+                throw new DatabaseException(sqlex.Number, sqlex.Message, query, parameters);
+            }
+            catch (Exception ex)
+            {
+                if (ex.Message.StartsWith("When using the multi-mapping APIs"))
+                {
+                    throw new DatabaseException(-999, ex.Message, query, parameters);
+                }
+                else
+                {
+                    throw;
+                }
+            }
+
+            return result;
+        }
+
+        public async Task<IList<T>> QueryAsync<T>(string query, Dictionary<string, object> parameters, int retryCount = 0)
+        {
+            bool retry = false;
+            var p = new DynamicParameters();
+
+            foreach (var par in parameters)
+            {
+                p.Add("@" + par.Key, par.Value);
+            }
+
+            IList<T> result = null;
+
+            try
+            {
+                using (var conn = CreateConnection())
+                {
+                    await ((SqlConnection)conn).OpenAsync();
+                    result = (await conn.QueryAsync<T>(query, p)).ToList();
+                }
+            }
+            catch (SqlException sqlex)
+            {
+                if (LOCK_ERROR_NUMBERS.Contains(sqlex.Number) && retryCount < MAX_RETRIES)
+                {
+                    Logger.Instance.Warn(sqlex.Message, "DataAccess");
+                    retry = true;
+                }
+                else
+                {
+                throw new DatabaseException(sqlex.Number, sqlex.Message, query, parameters);
+            }
+            }
+            catch (Exception ex)
+            {
+                if (ex.Message.StartsWith("When using the multi-mapping APIs"))
+                {
+                    throw new DatabaseException(-999, ex.Message, query, parameters);
+                }
+                else
+                {
+                    throw;
+                }
+            }
+
+            return retry ? await QueryAsync<T>(query, parameters, ++retryCount) : result;
+        }
+
+        public DataTable QueryScript(string script, Dictionary<string, object> parameters, int retryCount = 0)
+        {
+#if DEBUG
+            VerParametrosEnviados(script, parameters);
+#endif
+            DataSet result = new DataSet();
+
+            try
+            {
+                var factory = DbProviderFactories.GetFactory("System.Data.SqlClient");
+                using (var conn = CreateConnection())
+                {
+                    conn.Open();
+                    using(var tran = conn.BeginTransaction())
+                    {
+                    using (var cmd = conn.CreateCommand())
+                    {
+                            cmd.Transaction = tran;
+                        cmd.CommandText = script;
+                        cmd.CommandType = CommandType.Text;
+                        cmd.CommandTimeout = 300;
+
+                        foreach (var par in parameters)
+                        {
+                            cmd.Parameters.Add(new SqlParameter("@" + par.Key, par.Value ?? DBNull.Value));
+                        }
+                        
+                        var adapter = factory.CreateDataAdapter();
+                        adapter.SelectCommand = (DbCommand)cmd;
+                        adapter.Fill(result);
+                    }
+                        tran.Rollback();
+                    }
+                }
+            }
+            catch (SqlException sqlex)
+            {
+                if (LOCK_ERROR_NUMBERS.Contains(sqlex.Number) && retryCount < MAX_RETRIES)
+                {
+                    Logger.Instance.Warn(sqlex.Message, "DataAccess");
+                    return QueryScript(script, parameters, ++retryCount);
+                }
+                throw new DatabaseException(sqlex.Number, sqlex.Message, script, parameters);
+            }
+
+            return result.Tables.Count > 0 ? result.Tables[0] : null;
+        }
+
+        public DataTable QueryDataTable(string spName, Dictionary<string, object> parameters, int retryCount = 0)
+        {
+#if DEBUG
+            VerParametrosEnviados(spName, parameters);
+#endif
+            DataSet result = new DataSet();
+
+            try
+            {
+                var factory = DbProviderFactories.GetFactory("System.Data.SqlClient");
+                using (var conn = CreateConnection())
+                {
+                    conn.Open();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = spName;
+                        cmd.CommandType = CommandType.StoredProcedure;
+                        cmd.CommandTimeout = 300;
+
+                        foreach (var par in parameters)
+                        {
+                            cmd.Parameters.Add(new SqlParameter("@" + par.Key, par.Value ?? DBNull.Value));
+                        }
+
+                        var paramNmbError = new SqlParameter("@NmbError", SqlDbType.Int) { Direction = ParameterDirection.Output };
+                        cmd.Parameters.Add(paramNmbError);
+                        var paramMsgError = new SqlParameter("@MsgError", SqlDbType.VarChar) { Direction = ParameterDirection.Output, Size = int.MaxValue };
+                        cmd.Parameters.Add(paramMsgError);
+
+                        var adapter = factory.CreateDataAdapter();
+                        adapter.SelectCommand = (DbCommand)cmd;
+                        adapter.Fill(result);
+
+                        var code = paramNmbError.Value as int?;
+                        var message = paramMsgError.Value as string;
+
+                        if (code.HasValue && code.Value != 0) throw new DatabaseException(code.Value, message, spName, parameters);
+                    }
+                }
+            }
+            catch (SqlException sqlex)
+            {
+                if (LOCK_ERROR_NUMBERS.Contains(sqlex.Number) && retryCount < MAX_RETRIES)
+                {
+                    Logger.Instance.Warn(sqlex.Message, "DataAccess");
+                    return QueryDataTable(spName, parameters, ++retryCount);
+                }
+                throw new DatabaseException(sqlex.Number, sqlex.Message, spName, parameters);
+            }
+
+            return result.Tables[0];
+        }
+
+        public IList<T> ExecuteQueryExtended<T>(string spName, Dictionary<string, object> parameters, bool sendErrorParams = true)
+            where T : BaseViewModel
+        {
+            var dt = QueryDataTable(spName, parameters);
+            var list = new List<T>();
+            var type = typeof(T);
+            var props = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+
+            foreach (DataRow row in dt.Rows)
+            {
+                var obj = (T)Activator.CreateInstance(type);
+
+                foreach (DataColumn col in dt.Columns)
+                {
+                    var prop = props.SingleOrDefault(p => p.Name == col.ColumnName);
+                    if (prop != null && prop.GetSetMethod() != null)
+                    {
+                        prop.SetValue(obj, ChangeType(row[col], prop.PropertyType));
+                    }
+                    else
+                    {
+                        ((BaseViewModel)obj)._additionalProperties[col.ColumnName] = new Tuple<Type, object>(col.DataType, row[col]);
+                    }
+                }
+
+                list.Add(obj);
+            }
+
+            return list;
+        }
+
+        private object ChangeType(object value, Type type)
+        {
+            var parameterType = type;
+            var baseType = Nullable.GetUnderlyingType(parameterType);
+            var isNullable = baseType != null;
+            if (isNullable) parameterType = baseType;
+
+            if (value == null || Convert.IsDBNull(value))
+            {
+                if (type.IsValueType)
+                {
+                    return Activator.CreateInstance(type);
+                }
+                else
+                {
+                    return null;
+                }
+            }
+
+            return Convert.ChangeType(value, parameterType);
+        }
+
+        public IList<T> ExecuteQuery<T>(string spName, Dictionary<string, object> parameters, bool sendErrorParams = true, int retryCount = 0)
+        {
+#if DEBUG
+            VerParametrosEnviados(spName, parameters);
+#endif
+
+            var p = new DynamicParameters();
+            foreach (var par in parameters)
+            {
+                p.Add("@" + par.Key, par.Value);
+            }
+
+            if (sendErrorParams)
+            {
+                p.Add("@NmbError", dbType: DbType.Int32, direction: ParameterDirection.Output);
+                p.Add("@MsgError", dbType: DbType.String, direction: ParameterDirection.Output, size: int.MaxValue);
+            }
+
+            IList<T> result;
+
+            try
+            {
+                using (var conn = CreateConnection())
+                {
+                    conn.Open();
+                    result = conn.Query<T>(spName, p, commandType: CommandType.StoredProcedure, commandTimeout: 300).ToList();
+                }
+            }
+            catch (SqlException sqlex)
+            {
+                if (LOCK_ERROR_NUMBERS.Contains(sqlex.Number) && retryCount < MAX_RETRIES)
+                {
+                    Logger.Instance.Warn(sqlex.Message, "DataAccess");
+                    return ExecuteQuery<T>(spName, parameters, sendErrorParams, ++retryCount);
+                }
+                throw new DatabaseException(sqlex.Number, sqlex.Message, spName, parameters);
+            }
+            catch (Exception ex)
+            {
+                if (ex.Message.StartsWith("When using the multi-mapping APIs"))
+                {
+                    throw new DatabaseException(-999, ex.Message, spName, parameters);
+                }
+                else
+                {
+                    throw;
+                }
+            }
+
+            if (sendErrorParams)
+            {
+                var code = p.Get<int?>("@NmbError");
+                var message = p.Get<string>("@MsgError");
+
+                if (code.HasValue && code.Value != 0) throw new DatabaseException(code.Value, message, spName, parameters);
+            }
+
+            return result;
+        }
+
+        public async Task<IList<T>> ExecuteQueryAsync<T>(string spName, Dictionary<string, object> parameters, bool sendErrorParams = true, int retryCount = 0)
+        {
+#if DEBUG
+            VerParametrosEnviados(spName, parameters);
+#endif
+            var retry = false;
+            var p = new DynamicParameters();
+            foreach (var par in parameters)
+            {
+                p.Add("@" + par.Key, par.Value);
+            }
+
+            if (sendErrorParams)
+            {
+                p.Add("@NmbError", dbType: DbType.Int32, direction: ParameterDirection.Output);
+                p.Add("@MsgError", dbType: DbType.String, direction: ParameterDirection.Output, size: int.MaxValue);
+            }
+
+            IList<T> result = null;
+
+            try
+            {
+                using (var conn = CreateConnection())
+                {
+                    await ((SqlConnection)conn).OpenAsync();
+                    result = (await conn.QueryAsync<T>(spName, p, commandType: CommandType.StoredProcedure, commandTimeout: 300)).ToList();
+                }
+            }
+            catch (SqlException sqlex)
+            {
+                if (LOCK_ERROR_NUMBERS.Contains(sqlex.Number) && retryCount < MAX_RETRIES)
+                {
+                    Logger.Instance.Warn(sqlex.Message, "DataAccess");
+                    retry = true;
+                }
+                else
+                {
+                throw new DatabaseException(sqlex.Number, sqlex.Message, spName, parameters);
+            }
+            }
+            catch (Exception ex)
+            {
+                if (ex.Message.StartsWith("When using the multi-mapping APIs"))
+                {
+                    throw new DatabaseException(-999, ex.Message, spName, parameters);
+                }
+                else
+                {
+                    throw;
+                }
+            }
+
+            if (sendErrorParams)
+            {
+                var code = p.Get<int?>("@NmbError");
+                var message = p.Get<string>("@MsgError");
+
+                if (code.HasValue && code.Value != 0) throw new DatabaseException(code.Value, message, spName, parameters);
+            }
+
+            return retry ? await ExecuteQueryAsync<T>(spName, parameters, sendErrorParams, ++retryCount) : result;
+        }
+
+        public IList<T> ExecuteQuery<T>(string spName, Dictionary<string, object> parameters, int pageIndex, int pageSize, out int totalCount)
+        {
+            totalCount = 0;
+            parameters.Add("PageIndex", pageIndex);
+            parameters.Add("PageSize", pageSize);
+
+            var result = ExecuteQuery<T>(spName, parameters);
+            if (typeof(BaseViewModel).IsAssignableFrom(typeof(T)) && result.Count > 0)
+            {
+                totalCount = ((BaseViewModel)(object)result.First()).total_count;
+            }
+
+            return result;
+        }
+
+        public async Task<Tuple<IList<T>, int>> ExecuteQueryAsync<T>(string spName, Dictionary<string, object> parameters, int pageIndex, int pageSize)
+        {
+            var totalCount = 0;
+            parameters.Add("PageIndex", pageIndex);
+            parameters.Add("PageSize", pageSize);
+
+            var result = await ExecuteQueryAsync<T>(spName, parameters);
+            if (typeof(BaseViewModel).IsAssignableFrom(typeof(T)) && result.Count > 0)
+            {
+                totalCount = ((BaseViewModel)(object)result.First()).total_count;
+            }
+
+            return new Tuple<IList<T>, int>(result, totalCount);
+        }
+
+        public int ExecuteNonQuery(string spName, Dictionary<string, object> parameters, int retryCount = 0, bool sendErrorParams = true)
+        {
+#if DEBUG
+            VerParametrosEnviados(spName, parameters);
+#endif
+
+            var p = new DynamicParameters();
+            foreach (var par in parameters)
+            {
+                p.Add("@" + par.Key, par.Value);
+            }
+
+            if (sendErrorParams)
+            {
+                p.Add("@NmbError", dbType: DbType.Int32, direction: ParameterDirection.Output);
+                p.Add("@MsgError", dbType: DbType.String, direction: ParameterDirection.Output, size: int.MaxValue);
+            }
+            p.Add("@Return", dbType: DbType.Int32, direction: ParameterDirection.ReturnValue);
+
+            int numRows;
+
+            try
+            {
+                using (var conn = CreateConnection())
+                {
+                    conn.Open();
+                    numRows = conn.Execute(spName, p, commandType: CommandType.StoredProcedure, commandTimeout: 180);
+                }
+            }
+            catch (SqlException sqlex)
+            {
+                if (LOCK_ERROR_NUMBERS.Contains(sqlex.Number) && retryCount < MAX_RETRIES)
+                {
+                    Logger.Instance.Warn(sqlex.Message, "DataAccess");
+                    return ExecuteNonQuery(spName, parameters, ++retryCount);
+                }
+                throw new DatabaseException(sqlex.Number, sqlex.Message, spName, parameters);
+            }
+            catch (Exception ex)
+            {
+                if (ex.Message.StartsWith("When using the multi-mapping APIs"))
+                {
+                    throw new DatabaseException(-999, ex.Message, spName, parameters);
+                }
+                else
+                {
+                    throw;
+                }
+            }
+            var result = p.Get<int>("@Return");
+            if (sendErrorParams)
+            {
+                var code = p.Get<int?>("@NmbError");
+                var message = p.Get<string>("@MsgError");
+
+                if (code.HasValue && code.Value != 0) throw new DatabaseException(code.Value, message, spName, parameters);
+            }
+            return result;
+        }
+
+        public async Task<int> ExecuteNonQueryAsync(string spName, Dictionary<string, object> parameters, int retryCount = 0, bool sendErrorParams = true)
+        {
+#if DEBUG
+            VerParametrosEnviados(spName, parameters);
+#endif
+
+            var retry = false;
+            var p = new DynamicParameters();
+            foreach (var par in parameters)
+            {
+                p.Add("@" + par.Key, par.Value);
+            }
+
+            if (sendErrorParams)
+            {
+                p.Add("@NmbError", dbType: DbType.Int32, direction: ParameterDirection.Output);
+                p.Add("@MsgError", dbType: DbType.String, direction: ParameterDirection.Output, size: int.MaxValue);
+            }
+            p.Add("@Return", dbType: DbType.Int32, direction: ParameterDirection.ReturnValue);
+
+            int numRows;
+            int result = 0;
+
+            try
+            {
+                using (var conn = CreateConnection())
+                {
+                    await ((SqlConnection)conn).OpenAsync();
+                    numRows = await conn.ExecuteAsync(spName, p, commandType: CommandType.StoredProcedure, commandTimeout: 180);
+                }
+
+                result = p.Get<int>("@Return");
+            }
+            catch (SqlException sqlex)
+            {
+                if (LOCK_ERROR_NUMBERS.Contains(sqlex.Number) && retryCount < MAX_RETRIES)
+                {
+                    Logger.Instance.Warn(sqlex.Message, "DataAccess");
+                    retry = true;
+                }
+                else
+                {
+                throw new DatabaseException(sqlex.Number, sqlex.Message, spName, parameters);
+            }
+            }
+            catch (Exception ex)
+            {
+                if (ex.Message.StartsWith("When using the multi-mapping APIs"))
+                {
+                    throw new DatabaseException(-999, ex.Message, spName, parameters);
+                }
+                else
+                {
+                    throw;
+                }
+            }
+            
+            if (sendErrorParams)
+            {
+                var code = p.Get<int?>("@NmbError");
+                var message = p.Get<string>("@MsgError");
+
+                if (code.HasValue && code.Value != 0) throw new DatabaseException(code.Value, message, spName, parameters);
+            }
+
+            return retry ? await ExecuteNonQueryAsync(spName, parameters, ++retryCount) : result;
+        }
+
+        //Este es un metodo para la depuración de los parámetros enviados a bd desde desarrollo
+        //Es para facilitar la depuración de sps ya que muchas veces son demasiados parámetros que hay que pasar a los de soporte
+        //SOLO SE EJECUTA POR EL DESARROLLADOR EN DEPURACION
+        private void VerParametrosEnviados(string sp, Dictionary<string, object> parameters)
+        {
+            try
+            {
+                System.Diagnostics.Debug.WriteLine("----------------------------------");
+                string results = sp + " - Parametros:  \n " + string.Join("\n", parameters.Where(m => m.Key != "aplent_codigoP").Select(m => string.Format("{0} = '{1}'", m.Key, m.Value)));
+                System.Diagnostics.Debug.WriteLine(results);
+            }
+            catch { }
+        }
+
+        private IDbConnection CreateConnection()
+        {
+            var factory = DbProviderFactories.GetFactory("System.Data.SqlClient");
+            var cnn = factory.CreateConnection();
+            cnn.ConnectionString = this.connectionString;
+
+            return cnn;
+        }
+    }
+}
+http://csharp-video-tutorials.blogspot.com.co/2013/05/part-11-using-business-objects-as-model.html
+http://csharp-video-tutorials.blogspot.com.co/2013/05/part-13-formcollection-in-mvc.html

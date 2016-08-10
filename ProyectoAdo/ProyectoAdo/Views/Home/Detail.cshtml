@@ -1,0 +1,13 @@
+﻿@model ProyectoAdo.Models.Employee
+@{
+    ViewBag.Title = "Detail";
+}
+
+<ul>
+    <li>@Html.LabelFor(m => m.FirstName): @Model.FirstName </li>
+    <li>@Html.LabelFor(m => m.LastName): @Model.LastName </li>
+    <li>@Html.LabelFor(m => m.Salary): @Model.Salary </li>
+    <li>@Html.LabelFor(m => m.Gender): @Model.Gender </li>
+    <li>@Html.LabelFor(m => m.DepartmentId): @Model.DepartmentId </li>
+</ul>
+
