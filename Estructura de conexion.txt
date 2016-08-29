@@ -638,3 +638,29 @@ namespace Q10.Core.Data
 }
 http://csharp-video-tutorials.blogspot.com.co/2013/05/part-11-using-business-objects-as-model.html
 http://csharp-video-tutorials.blogspot.com.co/2013/05/part-13-formcollection-in-mvc.html
+/****/
+http://stackoverflow.com/questions/11270999/how-can-i-map-the-results-of-a-sql-query-onto-objects
+http://stackoverflow.com/questions/6134359/read-connection-string-from-web-config
+http://stackoverflow.com/questions/5642474/setting-up-connection-string-in-asp-net-to-sql-server
+http://stackoverflow.com/questions/5096926/what-is-the-get-set-syntax-in-c
+/**Busqueda*/
+map query result in model c#
+
+
+
+/******sp*****/
+ALTER PROCEDURE getEmployee 
+	@ID int,
+	@NmbError int OUT,
+	@MsgError NVarchar(max) OUT
+AS
+BEGIN TRY
+    SELECT *
+	FROM employees
+	WHERE ID = @ID
+END TRY
+BEGIN CATCH
+    SET @NmbError =  ERROR_NUMBER();
+    SET @MsgError = ERROR_MESSAGE();
+END CATCH;
+GO
